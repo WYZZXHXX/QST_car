@@ -5,7 +5,6 @@
 int main(void)
   {
 		u8 i;
-
 		Stm32_Clock_Init(9);						//外部时钟8Mhz 9倍频  8*9= 72mhz系统72mhz
 		MY_NVIC_PriorityGroupConfig(2);	//=====中断优先级分组
 		uart_init(115200);	            //=====串口初始化为115200
@@ -15,7 +14,6 @@ int main(void)
 		colorful_led_Init();            //=====七彩灯初始化
 
 		printf("QST\r\n");
-		/**重要代码：全身灯光保持白色常亮**/
 		for(i=1; i<=led_num; i++)
 		{
 			L_ws2812_rgb(i, WS_WHITE);   // 前面 6 颗白色
@@ -23,20 +21,13 @@ int main(void)
 		}
 		L_ws2812_refresh(led_num);       // 前面刷新
 		R_ws2812_refresh(led_num);       // 后面刷新
-
 		while(1)
 		{
-
 		}
   }
 
-
-
-
 //小车全身彩色流动效果
 #include "sys.h"
-
-/* 前后两边 6 颗灯：红蓝绿白 渐变流动（每 500ms 整体移动一格） */
 void both_color_flow(void)
 {
 	u8 i, step, k;
@@ -73,7 +64,6 @@ int main(void)
 		colorful_led_Init();            //=====七彩灯初始化
 
 		printf("QST\r\n");
-		/**重要代码**/
 		while(1)
 		{
 			if(USART_RX_STA==1)         //收到串口命令 "HELLO" 才触发
