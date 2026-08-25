@@ -1,0 +1,75 @@
+//小车全身保持白色常亮
+#include "stm32f10x.h"
+#include "sys.h"
+
+int main(void)
+  {
+		u8 i;
+		Stm32_Clock_Init(9);						//外部时钟8Mhz 9倍频  8*9= 72mhz系统72mhz
+		MY_NVIC_PriorityGroupConfig(2);	//=====中断优先级分组
+		uart_init(115200);	            //=====串口初始化为115200
+		JTAG_Set(JTAG_SWD_DISABLE);     //=====关闭JTAG接口
+		JTAG_Set(SWD_ENABLE);           //=====开SWD接口 方便调试使用SWD接口下载
+
+		colorful_led_Init();            //=====七彩灯初始化
+
+		printf("QST\r\n");
+		for(i=1; i<=led_num; i++)
+		{
+			L_ws2812_rgb(i, WS_WHITE);   // 前面 6 颗白色
+			R_ws2812_rgb(i, WS_WHITE);   // 后面 6 颗白色
+		}
+		L_ws2812_refresh(led_num);       // 前面刷新
+		R_ws2812_refresh(led_num);       // 后面刷新
+		while(1)
+		{
+		}
+  }
+
+//小车全身彩色流动效果
+#include "sys.h"
+void both_color_flow(void)
+{
+	u8 i, step, k;
+	while(1)
+	{
+		for(step=0; step<4; step++)        // 4 种颜色偏移，整体流动一圈
+		{
+			for(i=1; i<=led_num; i++)
+			{
+				k = (i - 1 + step) % 4;    // 当前这颗灯该显示哪种颜色
+				switch(k)
+				{
+					case 0: R_ws2812_rgb(i, WS_RED);   L_ws2812_rgb(i, WS_RED);   break;   // 红
+					case 1: R_ws2812_rgb(i, WS_BLUE);  L_ws2812_rgb(i, WS_BLUE);  break;   // 蓝
+					case 2: R_ws2812_rgb(i, WS_GREEN); L_ws2812_rgb(i, WS_GREEN); break;   // 绿
+					case 3: R_ws2812_rgb(i, WS_WHITE); L_ws2812_rgb(i, WS_WHITE); break;   // 白
+				}
+			}
+			R_ws2812_refresh(led_num);     // 后面 6 颗刷新
+			L_ws2812_refresh(led_num);     // 前面 6 颗刷新
+			delay_ms(500);                 // 间隔 500ms 流动一格
+		}
+	}
+}
+
+int main(void)
+  {
+		Stm32_Clock_Init(9);						//外部时钟8Mhz 9倍频  8*9= 72mhz系统72mhz
+		MY_NVIC_PriorityGroupConfig(2);	//=====中断优先级分组
+		uart_init(115200);	            //=====串口初始化为115200
+		JTAG_Set(JTAG_SWD_DISABLE);     //=====关闭JTAG接口
+		JTAG_Set(SWD_ENABLE);           //=====开SWD接口 方便调试使用SWD接口下载
+
+		colorful_led_Init();            //=====七彩灯初始化
+
+		printf("QST\r\n");
+		while(1)
+		{
+			if(USART_RX_STA==1)         //收到串口命令 "HELLO" 才触发
+			{
+				both_color_flow();      //前后两边一起红蓝绿白渐变流动
+			}
+			delay_ms(500);
+		}
+  }
