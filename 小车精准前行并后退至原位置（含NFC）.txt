@@ -1,0 +1,31 @@
+#include "stm32f10x.h"
+#include "sys.h"
+#include "motor.h"          // PWM_Init / Set_Pwm
+#include "control_system.h" // Encoder / System_Control
+#include "nfc.h"            // NFC (PN532) via USART2
+
+int main(void)
+{
+    Stm32_Clock_Init(9);            // 72MHz system clock
+    MY_NVIC_PriorityGroupConfig(2); // interrupt priority group
+    uart_init(115200);              // USART1 init @ 115200
+    NFC_Init();                     // NFC module init (USART2, PA2/PA3)
+    JTAG_Set(JTAG_SWD_DISABLE);     // disable JTAG
+    JTAG_Set(SWD_ENABLE);           // enable SWD
+    Encoder_Init_TIM2();            // left encoder (TIM2, PA0/PA1)
+    Encoder_Init_TIM3();            // right encoder (TIM3, PA6/PA7)
+    PWM_Init(7199,9);               // PWM init @ 1kHz (TIM4)
+    colorful_led_Init();            // RGB LED init
+
+    SysTick_Config(72000000/1000);  // 1ms SysTick
+
+    printf("QST ready\r\n");
+
+    while(1)
+    {
+        NFC_Handler();              // NFC card polling state machine
+        delay_ms(20);
+    }
+}
+
+\\（注：本代码也包含了NFC读卡功能，效果为读取NFC卡时全身灯光流动）
