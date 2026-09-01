@@ -1,0 +1,25 @@
+#include "stm32f10x.h"
+#include "sys.h"
+#include "motor.h"          // PWM_Init / Set_Pwm
+#include "control_system.h" // Encoder
+#include "uart.h"           // Uart1_Init (USART1 RX for motor commands)
+
+int main(void)
+{
+    Stm32_Clock_Init(9);            // 72MHz system clock
+    MY_NVIC_PriorityGroupConfig(2); // interrupt priority group
+    Uart1_Init(115200);             // USART1 @ 115200 (PA10 RX motor cmds, PA9 TX printf)
+    JTAG_Set(JTAG_SWD_DISABLE);     // disable JTAG
+    JTAG_Set(SWD_ENABLE);           // enable SWD
+    Encoder_Init_TIM2();            // left encoder (TIM2, PA0/PA1)
+    Encoder_Init_TIM3();            // right encoder (TIM3, PA6/PA7)
+    PWM_Init(7199,9);               // PWM init @ 1kHz (TIM4)
+    colorful_led_Init();            // RGB LED init
+
+    printf("STM32 Ready - Motor Executor (Hi3861 -> USART1/PA10)\r\n");
+
+    while(1)
+    {
+        delay_ms(20);               // main loop idle, USART1 IRQ drives the motors
+    }
+}
