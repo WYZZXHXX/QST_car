@@ -1,0 +1,28 @@
+#include "stm32f10x.h"
+#include "sys.h"
+#include "motor.h"          // PWM_Init / Set_Pwm
+#include "control_system.h" // Encoder / System_Control
+#include "uart.h"           // Uart2_Init (USART2 RX for motor commands)
+
+int main(void)
+{
+    Stm32_Clock_Init(9);            // 72MHz system clock
+    MY_NVIC_PriorityGroupConfig(2); // interrupt priority group
+    uart_init(115200);              // USART1 init @ 115200 (debug printf)
+    Uart2_Init(115200);             // USART2 init @ 115200 (receive motor commands from Harmony)
+    JTAG_Set(JTAG_SWD_DISABLE);     // disable JTAG
+    JTAG_Set(SWD_ENABLE);           // enable SWD
+    Encoder_Init_TIM2();            // left encoder (TIM2, PA0/PA1)
+    Encoder_Init_TIM3();            // right encoder (TIM3, PA6/PA7)
+    PWM_Init(7199,9);               // PWM init @ 1kHz (TIM4)
+    colorful_led_Init();            // RGB LED init
+
+    SysTick_Config(72000000/1000);  // 1ms SysTick
+
+    printf("STM32 Ready - Waiting for Harmony commands...\r\n");
+
+    while(1)
+    {
+        delay_ms(20);               // main loop idle, SysTick + UART2 IRQ drive everything
+    }
+}
