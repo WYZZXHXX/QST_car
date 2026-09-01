@@ -1,0 +1,133 @@
+#include <stdio.h>
+#include <unistd.h>
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include "wifiiot_uart.h"
+#include "hi_io.h"
+#include "hi_time.h"
+
+/* ============================================================
+ * TCRT5000 Edge Detection (Hi3861)
+ *
+ * Reference: 2.0_TCRT_Timer/TCRT.c
+ *   GPIO_13=left, GPIO_14=right
+ *   GPIO_VALUE0(LOW)=black=EDGE, GPIO_VALUE1(HIGH)=white=SAFE
+ *
+ *   If your module outputs opposite polarity, flip EDGE_IS_LOW:
+ *     0 = HIGH is edge, 1 = LOW is edge
+ * ============================================================ */
+
+#define IR_L  WIFI_IOT_GPIO_IDX_13
+#define IR_R  WIFI_IOT_GPIO_IDX_14
+
+#define EDGE_IS_LOW  0    // 反极性：0=HIGH=edge（HIGH=无反射/悬空）
+#define FWD_SPEED    60
+#define BACK_SPEED   50
+#define TURN_SPEED   60
+
+uint8_t uart_buf[20];
+
+static void motor_send(int mA, int mB)
+{
+    uint8_t ad = 0, bd = 0;
+    if (mA < 0) { ad = 1; mA = -mA; }
+    if (mB < 0) { bd = 1; mB = -mB; }
+    if (mA > 150) mA = 150;
+    if (mB > 150) mB = 150;
+
+    uart_buf[0] = 0xFC; uart_buf[1] = ad;
+    uart_buf[2] = mA;    uart_buf[3] = bd;
+    uart_buf[4] = mB;    uart_buf[5] = 0xFD;
+    UartWrite(WIFI_IOT_UART_IDX_2, uart_buf, 6);
+}
+
+static void ctrl_cb(void *arg)
+{
+    (void)arg;
+    static int state = 0;      // 0=FWD, 1=BACK, 2=L, 3=R
+      static int timer = 0;
+      static int ecnt  = 0;
+      static int edge_side = 0;  // 0=右边触发, 1=左边触发
+      WifiIotGpioValue vl, vr;
+    int L, R, edge;
+
+    timer += 20;
+
+    GpioGetInputVal(IR_L, &vl);
+    GpioGetInputVal(IR_R, &vr);
+
+    /* Convert to edge flag */
+    if (EDGE_IS_LOW) {
+        L = (vl == WIFI_IOT_GPIO_VALUE0) ? 1 : 0;
+        R = (vr == WIFI_IOT_GPIO_VALUE0) ? 1 : 0;
+    } else {
+        L = (vl == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+        R = (vr == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+    }
+
+    /* Print every 500ms */
+    if (timer % 500 < 20) {
+        printf("[TCRT] raw(L=%d R=%d) edge(L=%d R=%d) state=%d\r\n",
+               (int)vl, (int)vr, L, R, state);
+    }
+
+    edge = (L || R);
+
+    /* FWD: detect edge */
+    if (state == 0) {
+        if (edge) ecnt++; else ecnt = 0;
+         if (ecnt >= 3) {           // 60ms debounce
+              ecnt = 0; timer = 0;
+              state = 1;             // back up
+              edge_side = L;         // 保存触发侧（后退后 L 会变，需锁存）
+              printf("!!! EDGE L=%d R=%d !!!\r\n", L, R);
+          }
+    }
+
+    switch (state) {
+        case 0: motor_send( FWD_SPEED,  FWD_SPEED); break;
+        case 1: // back up
+            motor_send(-BACK_SPEED, -BACK_SPEED);
+            if (timer >= 400) { timer = 0; state = edge_side ? 3 : 2; }
+            break;
+        case 2: // turn left
+            motor_send(-TURN_SPEED,  TURN_SPEED);
+            if (timer >= 600) { timer = 0; state = 0; printf("-> FWD\r\n"); }
+            break;
+        case 3: // turn right
+            motor_send( TURN_SPEED, -TURN_SPEED);
+            if (timer >= 600) { timer = 0; state = 0; printf("-> FWD\r\n"); }
+            break;
+    }
+}
+
+static void EdgeDetect(void)
+{
+    printf("\r\n=== TCRT5000 Edge Detection ===\r\n");
+
+    GpioInit();
+
+    /* IR sensors */
+      IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
+      IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
+      GpioSetDir(IR_L, WIFI_IOT_GPIO_DIR_IN);
+      GpioSetDir(IR_R, WIFI_IOT_GPIO_DIR_IN);
+
+    /* UART2 */
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_UART2_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_12, WIFI_IOT_IO_FUNC_GPIO_12_UART2_RXD);
+     WifiIotUartAttribute ua = {
+          .baudRate = 115200, .dataBits = 8, .stopBits = 1, .parity = 0 };
+      unsigned int uart_ret = UartInit(WIFI_IOT_UART_IDX_2, &ua, NULL);
+      printf("UART2 init ret=%u (0=WIFI_IOT_SUCCESS)\r\n", uart_ret);
+
+    osTimerId_t tid = osTimerNew(ctrl_cb, osTimerPeriodic, NULL, NULL);
+    if (tid) {
+        osTimerStart(tid, 2U);
+        printf("Started. EDGE_IS_LOW=%d. Watch [TCRT] output...\r\n", EDGE_IS_LOW);
+    }
+}
+
+APP_FEATURE_INIT(EdgeDetect);
