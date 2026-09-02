@@ -1,0 +1,197 @@
+/*
+ * 13.0_BLE_Car - 手机蓝牙遥控小车
+ *
+ * 功能:
+ *   手机"蓝牙调试器"App 通过蓝牙发送指令(前进/后退/左转/右转/停止),
+ *   蓝牙模块(接 Hi3861 UART1: GPIO0=TX / GPIO1=RX)把指令透传给 Hi3861,
+ *   Hi3861 解析指令后, 通过 GPIO11 软件时序(bit-bang)模拟串口 TX @9600,
+ *   把电机控制帧发给 STM32F103 的 USART1, 由 STM32 驱动 L9110S 电机。
+ *
+ * 为什么用 bit-bang 而不是 UART2:
+ *   Hi3861 的 UART1 和 UART2 不能同时初始化, 而电机线是单向只发,
+ *   所以用 GPIO11 软件模拟串口发送, 省掉 UART2。
+ *   注意: STM32 端 Uart1_Init 需改为 9600 波特率, 与本文件 MOTOR_BAUD 一致。
+ *
+ * 手机端指令表(字母与数字两种按键面板都支持):
+ *   'F'/'f' 或 '1'  -> 前进(持续)
+ *   'B'/'b' 或 '2'  -> 后退(持续)
+ *   'L'/'l' 或 '3'  -> 左转(持续, 直到发新指令才停)
+ *   'R'/'r' 或 '4'  -> 右转(持续, 直到发新指令才停)
+ *   'S'/'s' 或 '0'  -> 停止
+ *
+ * 电机控制帧(Hi3861 -> STM32, 9600, 6字节):
+ *   0xFC + A_dir + motorA + B_dir + motorB + 0xFD
+ *     A_dir/B_dir : 0=正转(前进), 1=反转(后退)
+ *     motorA/motorB : 0~150 速度
+ */
+#include <stdio.h>
+#include <unistd.h>
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include "wifiiot_uart.h"
+#include "wifiiot_errno.h"
+#include "hi_io.h"
+#include "hi_time.h"
+#include "hi_isr.h"      /* hi_int_lock / hi_int_restore */
+
+/* ========== 端口与速度配置 ========== */
+#define BLE_UART      WIFI_IOT_UART_IDX_1   /* 蓝牙模块 UART1 (GPIO0=TX, GPIO1=RX) */
+
+#define MOTOR_TX_PIN  WIFI_IOT_GPIO_IDX_11  /* 软件串口 TX, 接 STM32 USART1_RX (PA10) */
+#define MOTOR_BAUD    9600                  /* 与 STM32 端 Uart1_Init(9600) 保持一致 */
+#define BIT_DELAY_US  (1000000 / MOTOR_BAUD)/* 每 bit 时长 = 104us */
+
+#define FWD_SPEED     60   /* 前进速度 0~150 */
+#define BACK_SPEED    50   /* 后退速度 0~150 */
+#define TURN_IN_SPEED 25   /* 转弯内侧轮速度(慢) */
+#define TURN_OUT_SPEED 55  /* 转弯外侧轮速度(快) */
+
+/* 直行微调: 车往右偏就增大(左轮加速), 往左偏就减小(左轮减速), 范围约 ±15 */
+#define FWD_LEFT_TRIM 0
+
+#define RX_BUF_SIZE   32
+
+static void BleCarTask(void);
+
+/* ========== 软件串口(bit-bang) TX ========== */
+static void motor_uart_init(void)
+{
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_GPIO);
+    GpioSetDir(MOTOR_TX_PIN, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);   /* 空闲保持高电平 */
+}
+
+/* 发送一个字节: 起始位 + 8 数据位(LSB先) + 停止位 */
+static void motor_uart_putc(uint8_t byte)
+{
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE0);   /* 起始位(低) */
+    hi_udelay(BIT_DELAY_US);
+
+    for (int i = 0; i < 8; i++) {
+        if (byte & 0x01) {
+            GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);
+        } else {
+            GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE0);
+        }
+        hi_udelay(BIT_DELAY_US);
+        byte >>= 1;
+    }
+
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);   /* 停止位(高) */
+    hi_udelay(BIT_DELAY_US);
+}
+
+/* ========== 电机控制帧发送 ========== */
+static void motor_send(int mA, int mB)
+{
+    uint8_t ad = 0, bd = 0;
+    hi_u32 int_save;
+
+    if (mA < 0) { ad = 1; mA = -mA; }
+    if (mB < 0) { bd = 1; mB = -mB; }
+    if (mA > 150) mA = 150;
+    if (mB > 150) mB = 150;
+
+    /* 软串口发送期间必须关中断, 否则时序被打乱, STM32 会收到乱码帧 */
+    int_save = hi_int_lock();
+    motor_uart_putc(0xFC);
+    motor_uart_putc(ad);
+    motor_uart_putc((uint8_t)mA);
+    motor_uart_putc(bd);
+    motor_uart_putc((uint8_t)mB);
+    motor_uart_putc(0xFD);
+    hi_int_restore(int_save);
+}
+
+/* ========== 运动控制 ========== */
+static void car_forward(void) { motor_send( FWD_SPEED + FWD_LEFT_TRIM, FWD_SPEED); } /* 前进: 双轮正转 */
+static void car_back(void)    { motor_send(-BACK_SPEED,-BACK_SPEED); }   /* 后退: 双轮反转 */
+static void car_left(void)    { motor_send( TURN_IN_SPEED, TURN_OUT_SPEED); } /* 左转: 左慢右快(边走边转) */
+static void car_right(void)   { motor_send( TURN_OUT_SPEED, TURN_IN_SPEED); } /* 右转: 左快右慢 */
+static void car_stop(void)    { motor_send(0, 0); }                     /* 停止: 速度0 */
+
+/* ========== 指令解析 ========== */
+static void parse_cmd(char c)
+{
+    switch (c) {
+        case 'F': case 'f': case 'W': case 'w': case '1':
+            car_forward(); printf("[BLE] 前进\r\n"); break;
+        case 'B': case 'b': case '2':
+            car_back();    printf("[BLE] 后退\r\n"); break;
+        case 'L': case 'l': case '3':
+            car_left();    printf("[BLE] 左转\r\n"); break;
+        case 'R': case 'r': case '4':
+            car_right();   printf("[BLE] 右转\r\n"); break;
+        case 'S': case 's': case '0':
+            car_stop();    printf("[BLE] 停止\r\n"); break;
+        default:
+            printf("[BLE] 未知指令: 0x%02X\r\n", (unsigned char)c); break;
+    }
+}
+
+/* ========== 蓝牙接收任务 ========== */
+static void BleCarTask(void)
+{
+    uint8_t rx[RX_BUF_SIZE];
+
+    printf("[BLE] 蓝牙遥控任务启动, 等待手机指令...\r\n");
+    while (1) {
+        int n = UartRead(BLE_UART, rx, RX_BUF_SIZE);
+        if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                parse_cmd((char)rx[i]);
+            }
+        }
+        osDelay(1U);   /* 10ms 轮询间隔 */
+    }
+}
+
+/* ========== 硬件初始化 + 任务创建 ========== */
+static void BleCarInit(void)
+{
+    unsigned int ret;
+
+    printf("\r\n======== 手机蓝牙遥控小车 ========\r\n");
+
+    GpioInit();
+
+    /* 软件串口 TX(GPIO11) -> STM32, 只发不收 */
+    motor_uart_init();
+    printf("[BLE] 电机软串口已就绪(GPIO11 @%d)\r\n", MOTOR_BAUD);
+
+    /* UART1: 蓝牙模块 (9600 8N1), 非阻塞读 */
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_0, WIFI_IOT_IO_FUNC_GPIO_0_UART1_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_1, WIFI_IOT_IO_FUNC_GPIO_1_UART1_RXD);
+    WifiIotUartAttribute ble_attr = {
+        .baudRate = 9600, .dataBits = 8, .stopBits = 1, .parity = 0 };
+    WifiIotUartExtraAttr ble_extra = {0};
+    ble_extra.txBufSize = 32;
+    ble_extra.rxBufSize = 64;
+    ble_extra.rxBlock = WIFI_IOT_UART_BLOCK_STATE_NONE_BLOCK;
+    ret = UartInit(BLE_UART, &ble_attr, &ble_extra);
+    printf("[BLE] UART1(蓝牙) init ret=0x%08X\r\n", ret);
+    if (ret != WIFI_IOT_SUCCESS) {
+        printf("[BLE] UART1(蓝牙) 初始化失败!\r\n");
+        return;
+    }
+
+    printf("[BLE] 初始化完成, 等待手机指令\r\n");
+
+    car_stop();   /* 上电先停车 */
+
+    osThreadAttr_t attr = {0};
+    attr.name = "BleCarTask";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
+    attr.stack_size = 4096;
+    attr.priority = 25;
+    if (osThreadNew((osThreadFunc_t)BleCarTask, NULL, &attr) == NULL) {
+        printf("[BLE] 创建 BleCarTask 失败!\r\n");
+    }
+}
+
+APP_FEATURE_INIT(BleCarInit);
