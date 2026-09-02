@@ -1,0 +1,189 @@
+/*
+ * 10.0_Integrated/wifi_connect.c - 小车连接手机热点(OpenHarmony Wifi STA)
+ *
+ * 功能:
+ *   使用 OpenHarmony 系统提供的 wifiservice 服务 API, 让 Hi3861 小车以
+ *   STA(Station)模式连接手机开的热点。连接成功后通过 DHCP 自动获取 IP,
+ *   并周期打印连接状态与 IP 地址, 供后续 TCP/UDP 等网络通信使用。
+ *
+ * 参考文件:
+ *   vendor/hisi/hi3861/hi3861/app/demo/src/netcfg_sample.c
+ *   test/xts/acts/communication_lite/wifiservice_hal/src/wifiservice_func_test.c
+ *
+ * 使用前请按需修改下面的热点信息:
+ *   WIFI_SSID  -> 手机热点名称
+ *   WIFI_PSK   -> 手机热点密码(开放热点则设为 "")
+ *
+ * 注意: 本文件编译需在 BUILD.gn 的 include_dirs 中加入
+ *   //foundation/communication/interfaces/kits/wifi_lite/wifiservice
+ *   //vendor/hisi/hi3861/hi3861/third_party/lwip_sack/include
+ */
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+
+#include "wifi_device.h"
+#include "wifi_device_config.h"
+#include "wifi_linked_info.h"
+#include "wifi_event.h"
+#include "wifi_error_code.h"
+
+#include "lwip/netif.h"
+#include "lwip/netifapi.h"
+#include "lwip/ip4_addr.h"
+
+/* ========== 热点信息(按需修改) ========== */
+#define WIFI_SSID             "WYZMate70"   /* 手机热点名称 */
+#define WIFI_PSK              "Wyz20070524."  /* 热点密码; 开放热点改成 "" */
+
+#define WIFI_NETIF_NAME       "wlan0"     /* STA 网卡名(固定) */
+
+static WifiEvent       g_wifiEvent = {0}; /* 注册的 wifi 事件回调 */
+static struct netif   *g_wifiNetif = NULL;/* STA 网卡, 用于 DHCP / 查 IP */
+static volatile int    g_connected = 0;   /* 1=已连接, 0=未连接 */
+
+/* ========== 连接状态回调(wifi 服务在连接/断开时调用) ========== */
+static void OnWifiConnectionChanged(int state, WifiLinkedInfo *info)
+{
+    if (info == NULL) {
+        printf("[Wifi] 连接状态回调: info 为空\r\n");
+        return;
+    }
+
+    if (state == WIFI_STATE_AVALIABLE) {
+        g_connected = 1;
+        printf("[Wifi] 已连接热点: %s  (RSSI=%d)\r\n", info->ssid, info->rssi);
+        /* 连接成功后启动 DHCP, 自动获取 IP 地址 */
+        if (g_wifiNetif != NULL) {
+            netifapi_dhcp_start(g_wifiNetif);
+        }
+    } else {
+        g_connected = 0;
+        printf("[Wifi] 连接断开, reason=%d\r\n", info->disconnectedReason);
+    }
+}
+
+/* ========== STA 模式启动: 使能 wifi + 注册事件 ========== */
+static int WifiStaStart(void)
+{
+    WifiErrorCode error = EnableWifi();
+    if (error == ERROR_WIFI_BUSY) {
+        printf("[Wifi] STA 已在运行\r\n");
+    } else if (error != WIFI_SUCCESS) {
+        printf("[Wifi] EnableWifi 失败, error=%d\r\n", error);
+        return -1;
+    }
+
+    if (IsWifiActive() == WIFI_STA_NOT_ACTIVE) {
+        printf("[Wifi] STA 未激活\r\n");
+        return -1;
+    }
+
+    g_wifiEvent.OnWifiConnectionChanged = OnWifiConnectionChanged;
+    error = RegisterWifiEvent(&g_wifiEvent);
+    if (error != WIFI_SUCCESS) {
+        printf("[Wifi] RegisterWifiEvent 失败, error=%d\r\n", error);
+        return -1;
+    }
+
+    g_wifiNetif = netif_find(WIFI_NETIF_NAME);
+    if (g_wifiNetif == NULL) {
+        printf("[Wifi] 找不到 %s 网卡\r\n", WIFI_NETIF_NAME);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* ========== 添加热点配置并连接 ========== */
+static int WifiStaConnect(void)
+{
+    WifiDeviceConfig config = {0};
+    int netId = 0;
+    WifiErrorCode error;
+
+    (void)strcpy(config.ssid, WIFI_SSID);
+    (void)strcpy(config.preSharedKey, WIFI_PSK);
+    /* 密码为空说明是开放热点, 否则按 WPA2-PSK 处理 */
+    config.securityType = (config.preSharedKey[0] == '\0')
+                          ? WIFI_SEC_TYPE_OPEN : WIFI_SEC_TYPE_PSK;
+
+    error = AddDeviceConfig(&config, &netId);
+    if (error != WIFI_SUCCESS) {
+        printf("[Wifi] AddDeviceConfig 失败, error=%d\r\n", error);
+        return -1;
+    }
+
+    error = ConnectTo(netId);
+    if (error != WIFI_SUCCESS) {
+        printf("[Wifi] ConnectTo 失败, error=%d\r\n", error);
+        return -1;
+    }
+
+    printf("[Wifi] 正在连接热点 \"%s\"...\r\n", WIFI_SSID);
+    return 0;
+}
+
+/* ========== 查询连接状态并打印 IP ========== */
+static void WifiPrintStatus(void)
+{
+    WifiLinkedInfo info = {0};
+
+    if (GetLinkedInfo(&info) != WIFI_SUCCESS) {
+        printf("[Wifi] 获取连接信息失败\r\n");
+        return;
+    }
+
+    if (info.connState == WIFI_CONNECTED) {
+        printf("[Wifi] 连接成功: SSID=%s  RSSI=%d\r\n", info.ssid, info.rssi);
+        if (g_wifiNetif != NULL) {
+            printf("[Wifi] 本机 IP: %s\r\n",
+                   ip4addr_ntoa(netif_ip4_addr(g_wifiNetif)));
+        }
+    } else {
+        printf("[Wifi] 未连接\r\n");
+    }
+}
+
+/* ========== Wifi 连接任务 ========== */
+static void WifiConnectTask(void)
+{
+    printf("\r\n======== 小车连接手机热点(Wifi STA) ========\r\n");
+
+    if (WifiStaStart() != 0) {
+        printf("[Wifi] STA 启动失败\r\n");
+        return;
+    }
+
+    if (WifiStaConnect() != 0) {
+        printf("[Wifi] 连接失败\r\n");
+        return;
+    }
+
+    while (1) {
+        osDelay(300U);   /* 每 3 秒打印一次状态 */
+        WifiPrintStatus();
+    }
+}
+
+/* ========== 上电入口 ========== */
+static void WifiConnectInit(void)
+{
+    osThreadAttr_t attr = {0};
+    attr.name = "WifiConnectTask";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
+    attr.stack_size = 4096;
+    attr.priority = 25;
+
+    if (osThreadNew((osThreadFunc_t)WifiConnectTask, NULL, &attr) == NULL) {
+        printf("[Wifi] 创建 WifiConnectTask 失败!\r\n");
+    }
+}
+
+APP_FEATURE_INIT(WifiConnectInit);
