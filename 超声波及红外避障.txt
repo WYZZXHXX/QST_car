@@ -1,0 +1,272 @@
+/*
+ * 14.0_Hcsr04_Avoid - 超声波 + 红外自动避障小车
+ */
+#include <stdio.h>
+#include <unistd.h>
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include "hi_io.h"
+#include "hi_time.h"
+#include "hi_isr.h"
+
+#define TRIG_PIN  7
+#define ECHO_PIN  8
+
+#define SERVO_PIN   2
+#define SERVO_LEFT   500U
+#define SERVO_MID    1500U
+#define SERVO_RIGHT  2500U
+
+#define TCRT_L_PIN  WIFI_IOT_GPIO_IDX_13
+#define TCRT_R_PIN  WIFI_IOT_GPIO_IDX_14
+
+#define MOTOR_TX_PIN  WIFI_IOT_GPIO_IDX_11
+#define MOTOR_BAUD    9600
+#define BIT_DELAY_US  (1000000 / MOTOR_BAUD)
+
+#define FWD_SPEED     60
+#define BACK_SPEED    50
+#define TURN_IN_SPEED 25
+#define TURN_OUT_SPEED 55
+#define SPIN_SPEED    55
+
+#define THRESHOLD_CM  20.0f
+#define BACK_1S       100U
+#define TURN_90       150U
+#define TURN_DELAY    100U
+#define STOP_DELAY    10U
+#define LOOP_DELAY    10U
+
+static void AvoidTask(void);
+
+static void motor_uart_init(void)
+{
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_GPIO);
+    GpioSetDir(MOTOR_TX_PIN, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);
+}
+
+static void motor_uart_putc(uint8_t byte)
+{
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE0);
+    hi_udelay(BIT_DELAY_US);
+    for (int i = 0; i < 8; i++) {
+        if (byte & 0x01) {
+            GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);
+        } else {
+            GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE0);
+        }
+        hi_udelay(BIT_DELAY_US);
+        byte >>= 1;
+    }
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);
+    hi_udelay(BIT_DELAY_US);
+}
+
+static void motor_send(int mA, int mB)
+{
+    uint8_t ad = 0, bd = 0;
+    hi_u32 int_save;
+    if (mA < 0) { ad = 1; mA = -mA; }
+    if (mB < 0) { bd = 1; mB = -mB; }
+    if (mA > 150) mA = 150;
+    if (mB > 150) mB = 150;
+    int_save = hi_int_lock();
+    motor_uart_putc(0xFC);
+    motor_uart_putc(ad);
+    motor_uart_putc((uint8_t)mA);
+    motor_uart_putc(bd);
+    motor_uart_putc((uint8_t)mB);
+    motor_uart_putc(0xFD);
+    hi_int_restore(int_save);
+}
+
+static void car_forward(void) { motor_send( FWD_SPEED, FWD_SPEED); }
+static void car_back(void)    { motor_send(-BACK_SPEED, -BACK_SPEED); }
+static void car_left(void)    { motor_send( TURN_IN_SPEED, TURN_OUT_SPEED); }
+static void car_right(void)   { motor_send( TURN_OUT_SPEED, TURN_IN_SPEED); }
+static void car_stop(void)    { motor_send(0, 0); }
+static void car_spin_left(void)  { motor_send(-SPIN_SPEED, SPIN_SPEED); }
+static void car_spin_right(void) { motor_send( SPIN_SPEED, -SPIN_SPEED); }
+
+static void ServoSet(unsigned int duty)
+{
+    GpioSetOutputVal(SERVO_PIN, WIFI_IOT_GPIO_VALUE1);
+    hi_udelay(duty);
+    GpioSetOutputVal(SERVO_PIN, WIFI_IOT_GPIO_VALUE0);
+    hi_udelay(20000 - duty);
+}
+
+static void ServoTo(unsigned int duty)
+{
+    for (int i = 0; i < 10; i++) {
+        ServoSet(duty);
+    }
+}
+
+static float GetDistance(void)
+{
+    uint32_t start = 0, time = 0, flag = 0, to = 0;
+    WifiIotGpioValue v = WIFI_IOT_GPIO_VALUE0;
+    GpioSetOutputVal(TRIG_PIN, WIFI_IOT_GPIO_VALUE1);
+    hi_udelay(20);
+    GpioSetOutputVal(TRIG_PIN, WIFI_IOT_GPIO_VALUE0);
+    while (1) {
+        GpioGetInputVal(ECHO_PIN, &v);
+        if (v == WIFI_IOT_GPIO_VALUE1 && flag == 0) { start = hi_get_us(); flag = 1; }
+        if (v == WIFI_IOT_GPIO_VALUE0 && flag == 1) { time = hi_get_us() - start; break; }
+        if (++to > 50000) break;
+    }
+    return (time > 0) ? (float)time * 0.034f / 2.0f : 0.0f;
+}
+
+static void TcrtRead(uint8_t *l, uint8_t *r)
+{
+    WifiIotGpioValue v;
+    GpioGetInputVal(TCRT_L_PIN, &v);  *l = (v == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+    GpioGetInputVal(TCRT_R_PIN, &v);  *r = (v == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+}
+
+static void AvoidTask(void)
+{
+    printf("start obstacle avoidance\r\n");
+    ServoTo(SERVO_MID);
+
+    while (1) {
+        float d = GetDistance();
+        uint8_t l = 0, r = 0;
+        TcrtRead(&l, &r);
+
+        printf("d=%.1fcm IR:L%d R%d\r\n", d, (int)l, (int)r);
+
+        if (d > 0.0f && d <= THRESHOLD_CM) {
+            printf("[AVOID] front %.1fcm, back 1s\r\n", d);
+            car_stop();
+            osDelay(STOP_DELAY);
+            car_back();
+            osDelay(BACK_1S);
+            car_stop();
+            osDelay(STOP_DELAY);
+
+            ServoTo(SERVO_LEFT);
+            osDelay(30U);
+            float dL = GetDistance();
+            printf("[AVOID] left=%.1fcm\r\n", dL);
+
+            ServoTo(SERVO_RIGHT);
+            osDelay(30U);
+            float dR = GetDistance();
+            printf("[AVOID] right=%.1fcm\r\n", dR);
+
+            ServoTo(SERVO_MID);
+            osDelay(20U);
+
+            int leftClear  = (dL == 0.0f || dL > THRESHOLD_CM);
+            int rightClear = (dR == 0.0f || dR > THRESHOLD_CM);
+
+            if (leftClear) {
+                printf("[AVOID] spin left then forward\r\n");
+                car_spin_left();
+                osDelay(TURN_90);
+                car_stop();
+                osDelay(STOP_DELAY);
+                car_forward();
+            } else if (rightClear) {
+                printf("[AVOID] spin right then forward\r\n");
+                car_spin_right();
+                osDelay(TURN_90);
+                car_stop();
+                osDelay(STOP_DELAY);
+                car_forward();
+            } else {
+                printf("[AVOID] both blocked, back\r\n");
+                car_back();
+                osDelay(BACK_1S);
+                car_stop();
+            }
+            osDelay(STOP_DELAY);
+        }
+        else if (l && r) {
+            printf("[AVOID] both line, back then turn right\r\n");
+            car_stop();
+            osDelay(STOP_DELAY);
+            car_back();
+            osDelay(BACK_1S);
+            car_stop();
+            osDelay(STOP_DELAY);
+            car_right();
+            osDelay(TURN_DELAY);
+            car_stop();
+            osDelay(STOP_DELAY);
+        }
+        else if (l) {
+            printf("[AVOID] left line, back then turn right\r\n");
+            car_stop();
+            osDelay(STOP_DELAY);
+            car_back();
+            osDelay(BACK_1S);
+            car_stop();
+            osDelay(STOP_DELAY);
+            car_right();
+            osDelay(TURN_DELAY);
+            car_stop();
+            osDelay(STOP_DELAY);
+        }
+        else if (r) {
+            printf("[AVOID] right line, back then turn left\r\n");
+            car_stop();
+            osDelay(STOP_DELAY);
+            car_back();
+            osDelay(BACK_1S);
+            car_stop();
+            osDelay(STOP_DELAY);
+            car_left();
+            osDelay(TURN_DELAY);
+            car_stop();
+            osDelay(STOP_DELAY);
+        }
+        else {
+            car_forward();
+        }
+
+        osDelay(LOOP_DELAY);
+    }
+}
+
+static void AvoidInit(void)
+{
+    printf("\r\n======== avoid car ========\r\n");
+    GpioInit();
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_7, WIFI_IOT_IO_FUNC_GPIO_7_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_8, WIFI_IOT_IO_FUNC_GPIO_8_GPIO);
+    GpioSetDir(TRIG_PIN, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetDir(ECHO_PIN, WIFI_IOT_GPIO_DIR_IN);
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_2, WIFI_IOT_IO_FUNC_GPIO_2_GPIO);
+    GpioSetDir(SERVO_PIN, WIFI_IOT_GPIO_DIR_OUT);
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
+    GpioSetDir(TCRT_L_PIN, WIFI_IOT_GPIO_DIR_IN);
+    GpioSetDir(TCRT_R_PIN, WIFI_IOT_GPIO_DIR_IN);
+
+    motor_uart_init();
+    car_stop();
+
+    osThreadAttr_t attr = {0};
+    attr.name = "AvoidTask";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
+    attr.stack_size = 4096;
+    attr.priority = 25;
+    if (osThreadNew((osThreadFunc_t)AvoidTask, NULL, &attr) == NULL) {
+        printf("[AVOID] create task fail\r\n");
+    }
+}
+
+APP_FEATURE_INIT(AvoidInit);
