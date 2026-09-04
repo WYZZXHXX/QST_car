@@ -1,0 +1,71 @@
+#include "stm32f10x.h"
+#include "sys.h"
+#include "motor.h"          // PWM_Init / Set_Pwm
+#include "control_system.h" // Encoder
+#include "uart.h"           // Uart1_Init / g_line_event
+#include "colorful_led.h"   // WS2812 RGB 灯
+
+/* 检测到黑线后的动作时长(ms), 按需调 */
+#define LINE_PAUSE_MS  300   // 路口停顿时间
+
+/* 全车亮红灯(左右两条灯带全部点亮) */
+static void all_leds_red(void)
+{
+    u8 i;
+    for (i = 1; i <= led_num; i++) {
+        L_ws2812_rgb(i, WS_RED);
+        R_ws2812_rgb(i, WS_RED);
+    }
+    L_ws2812_refresh(led_num);
+    R_ws2812_refresh(led_num);
+}
+
+/* 全车关灯 */
+static void all_leds_off(void)
+{
+    u8 i;
+    for (i = 1; i <= led_num; i++) {
+        L_ws2812_rgb(i, WS_DARK);
+        R_ws2812_rgb(i, WS_DARK);
+    }
+    L_ws2812_refresh(led_num);
+    R_ws2812_refresh(led_num);
+}
+
+int main(void)
+{
+    static uint8_t prev_led = 0xFF;   /* 上次灯的状态, 0xFF 强制首次刷新 */
+
+    Stm32_Clock_Init(9);
+    MY_NVIC_PriorityGroupConfig(2);
+    Uart1_Init(9600);
+    JTAG_Set(JTAG_SWD_DISABLE);
+    JTAG_Set(SWD_ENABLE);
+    Encoder_Init_TIM2();
+    Encoder_Init_TIM3();
+    PWM_Init(7199,9);
+    colorful_led_Init();
+
+    printf("STM32 Ready - Motor Executor (Hi3861 -> USART1/PA10)\r\n");
+
+    while(1)
+    {
+        /* 路口事件: 停车 -> 停顿 -> 调整 */
+        if (g_line_event) {
+            Set_Pwm(0, 0);               // 停车
+            all_leds_red();              // 亮红灯
+            delay_ms(LINE_PAUSE_MS);     // 停顿
+            Set_Pwm(g_line_motorB, g_line_motorA);  // 调整
+            g_line_event = 0;
+        }
+
+        /* 指示灯: 单边微调/路口 -> 亮红灯; 直行 -> 灭灯(状态变化时才刷新) */
+        if (g_led_red != prev_led) {
+            prev_led = g_led_red;
+            if (g_led_red) all_leds_red();
+            else           all_leds_off();
+        }
+
+        delay_ms(20);
+    }
+}
