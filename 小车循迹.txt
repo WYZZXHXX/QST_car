@@ -1,0 +1,243 @@
+/*
+ * 15.0_Line_Track - 循迹小车(走迷宫, 左手法则)
+ *
+ * 功能:
+ *   两个 TCRT5000 红外对管(左=GPIO13, 右=GPIO14)检测地面黑线,
+ *   小车沿黑线行驶, 路口优先左转, 遇死路(T)后退回上一路口并右转。
+ *
+ * 循迹逻辑(黑线较窄, 居中时两个传感器都测不到线):
+ *   都白(居中)        -> 前进
+ *   左传感器压黑线    -> 车头偏右, 左转(弧线)修正
+ *   右传感器压黑线    -> 车头偏左, 右转(弧线)修正
+ *   两边都压黑线      -> 路口(Y/T)
+ *
+ * 路口处理(左手法则):
+ *   两边都黑 -> 先停车 -> 原地慢速左转 -> 压到黑线就是 Y 岔路, 继续循迹;
+ *   原地左转一直压不到黑线 -> 死路(T) -> 后退回上一个路口 -> 原地右转。
+ *
+ * 硬件连接:
+ *   红外对管 : 左=GPIO13, 右=GPIO14 (TCRT5000, 压到黑线输出高电平)
+ *   电机驱动 : GPIO11 软件串口(bit-bang) TX -> STM32F103 USART1 -> L9110S
+ *
+ * 电机控制帧(Hi3861 -> STM32, 9600, 6字节):
+ *   0xFC + A_dir + motorA + B_dir + motorB + 0xFD
+ *     A_dir/B_dir : 0=正转(前进), 1=反转(后退)
+ *     motorA/motorB : 0~150 速度
+ */
+#include <stdio.h>
+#include <unistd.h>
+#include "ohos_init.h"
+#include "cmsis_os2.h"
+#include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
+#include "hi_io.h"
+#include "hi_time.h"
+#include "hi_isr.h"
+
+#define TCRT_L_PIN  WIFI_IOT_GPIO_IDX_13
+#define TCRT_R_PIN  WIFI_IOT_GPIO_IDX_14
+
+#define MOTOR_TX_PIN  WIFI_IOT_GPIO_IDX_11
+#define MOTOR_BAUD    9600
+#define BIT_DELAY_US  (1000000 / MOTOR_BAUD)
+
+#define FWD_SPEED       60   /* 前进速度 0~150 */
+#define TURN_IN_SPEED   25   /* 循迹修正: 转向内侧轮速度(慢) */
+#define TURN_OUT_SPEED  55   /* 循迹修正: 转向外侧轮速度(快) */
+#define SPIN_SPEED      55   /* 路口原地转向速度(一正一反) */
+#define BACK_SPEED      50   /* 后退速度 */
+#define LOOP_DELAY      1U   /* 主循环周期 -> 10ms */
+
+/* 路口转向/回溯参数: 单位为 LOOP_DELAY 循环次数, 需按实际车速/转向半径实测标定 */
+#define SPIN_TICKS      30   /* 原地转向寻找黑线的最多循环次数(约转90°) */
+#define REVERSE_TICKS   25   /* 后退找上一个路口的超时循环次数 */
+
+static void LineTrackTask(void);
+
+static void motor_uart_init(void)
+{
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_GPIO);
+    GpioSetDir(MOTOR_TX_PIN, WIFI_IOT_GPIO_DIR_OUT);
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);   /* 空闲保持高电平 */
+}
+
+static void motor_uart_putc(uint8_t byte)
+{
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE0);   /* 起始位(低) */
+    hi_udelay(BIT_DELAY_US);
+    for (int i = 0; i < 8; i++) {
+        if (byte & 0x01) {
+            GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);
+        } else {
+            GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE0);
+        }
+        hi_udelay(BIT_DELAY_US);
+        byte >>= 1;
+    }
+    GpioSetOutputVal(MOTOR_TX_PIN, WIFI_IOT_GPIO_VALUE1);   /* 停止位(高) */
+    hi_udelay(BIT_DELAY_US);
+}
+
+static void motor_send(int mA, int mB)
+{
+    uint8_t ad = 0, bd = 0;
+    hi_u32 int_save;
+    if (mA < 0) { ad = 1; mA = -mA; }
+    if (mB < 0) { bd = 1; mB = -mB; }
+    if (mA > 150) mA = 150;
+    if (mB > 150) mB = 150;
+    /* 软串口发送期间必须关中断, 否则时序被打乱, STM32 收到乱码帧 */
+    int_save = hi_int_lock();
+    motor_uart_putc(0xFC);
+    motor_uart_putc(ad);
+    motor_uart_putc((uint8_t)mA);
+    motor_uart_putc(bd);
+    motor_uart_putc((uint8_t)mB);
+    motor_uart_putc(0xFD);
+    hi_int_restore(int_save);
+}
+
+static void car_forward(void)    { motor_send( FWD_SPEED, FWD_SPEED); }
+static void car_left(void)       { motor_send( TURN_IN_SPEED, TURN_OUT_SPEED); } /* 循迹左转: 左慢右快 */
+static void car_right(void)      { motor_send( TURN_OUT_SPEED, TURN_IN_SPEED); } /* 循迹右转: 左快右慢 */
+static void car_back(void)       { motor_send(-BACK_SPEED, -BACK_SPEED); }       /* 后退 */
+static void car_spin_left(void)  { motor_send(-SPIN_SPEED,  SPIN_SPEED); }       /* 原地左转: 左反右正 */
+static void car_spin_right(void) { motor_send( SPIN_SPEED, -SPIN_SPEED); }       /* 原地右转: 左正右反 */
+static void car_stop(void)       { motor_send(0, 0); }
+
+static void TcrtRead(uint8_t *l, uint8_t *r)
+{
+    WifiIotGpioValue v;
+    GpioGetInputVal(TCRT_L_PIN, &v);  *l = (v == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+    GpioGetInputVal(TCRT_R_PIN, &v);  *r = (v == WIFI_IOT_GPIO_VALUE1) ? 1 : 0;
+}
+
+/* 原地左转: 先停车, 再慢慢原地转; 先转出路口(两边都白), 再压到线就停.
+ * 返回 1=找到左边黑线, 0=超时(死路) */
+static int spin_left_until_line(void)
+{
+    uint8_t l, r;
+    int i, off = 0;
+
+    car_stop();
+    osDelay(2);
+
+    for (i = 0; i < SPIN_TICKS; i++) {
+        TcrtRead(&l, &r);
+        if (!l && !r) {
+            off = 1;
+        } else if (off) {
+            car_stop();
+            return 1;
+        }
+        car_spin_left();
+        osDelay(LOOP_DELAY);
+    }
+    car_stop();
+    return 0;
+}
+
+/* 原地右转(死路回溯后右转用), 逻辑同左转 */
+static int spin_right_until_line(void)
+{
+    uint8_t l, r;
+    int i, off = 0;
+
+    car_stop();
+    osDelay(2);
+
+    for (i = 0; i < SPIN_TICKS; i++) {
+        TcrtRead(&l, &r);
+        if (!l && !r) {
+            off = 1;
+        } else if (off) {
+            car_stop();
+            return 1;
+        }
+        car_spin_right();
+        osDelay(LOOP_DELAY);
+    }
+    car_stop();
+    return 0;
+}
+
+/* 后退, 直到重新压到路口(两边都黑), 或超时停车 */
+static void reverse_to_junction(void)
+{
+    uint8_t l, r;
+    int i;
+
+    for (i = 0; i < REVERSE_TICKS; i++) {
+        TcrtRead(&l, &r);
+        if (l && r) return;
+        car_back();
+        osDelay(LOOP_DELAY);
+    }
+    car_stop();
+}
+
+/* 路口处理: 优先左转; 左转找不到线就是死路 -> 后退右转 */
+static void junction_handle(void)
+{
+    printf("junction\r\n");
+
+    if (spin_left_until_line()) {
+        return;
+    }
+
+    printf("dead end, back and turn right\r\n");
+    reverse_to_junction();
+    spin_right_until_line();
+}
+
+static void LineTrackTask(void)
+{
+    printf("start line tracking\r\n");
+
+    while (1) {
+        uint8_t l = 0, r = 0;
+        TcrtRead(&l, &r);
+
+        printf("L%d R%d\r\n", (int)l, (int)r);
+
+        if (l && r) {
+            junction_handle();
+        } else if (l) {
+            car_left();
+        } else if (r) {
+            car_right();
+        } else {
+            car_forward();
+        }
+
+        osDelay(LOOP_DELAY);
+    }
+}
+
+static void LineTrackInit(void)
+{
+    printf("\r\n======== line track car ========\r\n");
+    GpioInit();
+
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
+    GpioSetDir(TCRT_L_PIN, WIFI_IOT_GPIO_DIR_IN);
+    GpioSetDir(TCRT_R_PIN, WIFI_IOT_GPIO_DIR_IN);
+
+    motor_uart_init();
+    car_stop();
+
+    osThreadAttr_t attr = {0};
+    attr.name = "LineTrackTask";
+    attr.attr_bits = 0U;
+    attr.cb_mem = NULL;
+    attr.cb_size = 0U;
+    attr.stack_mem = NULL;
+    attr.stack_size = 4096;
+    attr.priority = 25;
+    if (osThreadNew((osThreadFunc_t)LineTrackTask, NULL, &attr) == NULL) {
+        printf("[TRACK] create task fail\r\n");
+    }
+}
+
+APP_FEATURE_INIT(LineTrackInit);
